@@ -1,5 +1,4 @@
-var AWS = require('aws-sdk');
-var url = require('url');
+var { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 var https = require('https');
 var config = require('./config');
 var _ = require('lodash');
@@ -7,36 +6,37 @@ var hookUrl;
 
 var baseSlackMessage = {}
 
-var postMessage = function(message, callback) {
-  var body = JSON.stringify(message);
-  var options = url.parse(hookUrl);
-  options.method = 'POST';
-  options.headers = {
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(body),
-  };
+var postMessage = function(message) {
+  return new Promise(function(resolve, reject) {
+    var body = JSON.stringify(message);
+    var options = new URL(hookUrl);
+    options.method = 'POST';
+    options.headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    };
 
-  var postReq = https.request(options, function(res) {
-    var chunks = [];
-    res.setEncoding('utf8');
-    res.on('data', function(chunk) {
-      return chunks.push(chunk);
-    });
-    res.on('end', function() {
-      var body = chunks.join('');
-      if (callback) {
-        callback({
+    var postReq = https.request(options, function(res) {
+      var chunks = [];
+      res.setEncoding('utf8');
+      res.on('data', function(chunk) {
+        return chunks.push(chunk);
+      });
+      res.on('end', function() {
+        var body = chunks.join('');
+        resolve({
           body: body,
           statusCode: res.statusCode,
           statusMessage: res.statusMessage
         });
-      }
+      });
+      return res;
     });
-    return res;
-  });
 
-  postReq.write(body);
-  postReq.end();
+    postReq.on('error', reject);
+    postReq.write(body);
+    postReq.end();
+  });
 };
 
 var handleElasticBeanstalk = function(event, context) {
@@ -201,7 +201,7 @@ var handleElasticache = function(event, context) {
   var eventname, nodename;
   var color = "good";
 
-  for(key in message){
+  for (let key in message) {
     eventname = key;
     nodename = message[key];
     break;
@@ -287,7 +287,7 @@ var handleAutoScaling = function(event, context) {
   var eventname, nodename;
   var color = "good";
 
-  for(key in message){
+  for (let key in message) {
     eventname = key;
     nodename = message[key];
     break;
@@ -327,7 +327,7 @@ var handleCatchAll = function(event, context) {
 
     // Add all of the values from the event message to the Slack message description
     var description = ""
-    for(key in message) {
+    for (let key in message) {
 
         var renderedMessage = typeof message[key] === 'object'
                             ? JSON.stringify(message[key])
@@ -353,7 +353,7 @@ var handleCatchAll = function(event, context) {
   return _.merge(slackMessage, baseSlackMessage);
 }
 
-var processEvent = function(event, context) {
+var processEvent = async function(event, context) {
   console.log("sns received:" + JSON.stringify(event, null, 2));
   var slackMessage = null;
   var eventSubscriptionArn = event.Records[0].EventSubscriptionArn;
@@ -364,7 +364,7 @@ var processEvent = function(event, context) {
   try {
     eventSnsMessage = JSON.parse(eventSnsMessageRaw);
   }
-  catch (e) {    
+  catch (e) {
   }
 
   if(eventSubscriptionArn.indexOf(config.services.codepipeline.match_text) > -1 || eventSnsSubject.indexOf(config.services.codepipeline.match_text) > -1 || eventSnsMessageRaw.indexOf(config.services.codepipeline.match_text) > -1){
@@ -395,42 +395,36 @@ var processEvent = function(event, context) {
     slackMessage = handleCatchAll(event, context);
   }
 
-  postMessage(slackMessage, function(response) {
-    if (response.statusCode < 400) {
-      console.info('message posted successfully');
-      context.succeed();
-    } else if (response.statusCode < 500) {
-      console.error("error posting message to slack API: " + response.statusCode + " - " + response.statusMessage);
-      // Don't retry because the error is due to a problem with the request
-      context.succeed();
-    } else {
-      // Let Lambda retry
-      context.fail("server error when processing message: " + response.statusCode + " - " + response.statusMessage);
-    }
-  });
+  var response = await postMessage(slackMessage);
+  if (response.statusCode < 400) {
+    console.info('message posted successfully');
+  } else if (response.statusCode < 500) {
+    console.error("error posting message to slack API: " + response.statusCode + " - " + response.statusMessage);
+    // Don't retry because the error is due to a problem with the request
+  } else {
+    // Throwing lets Lambda retry
+    throw new Error("server error when processing message: " + response.statusCode + " - " + response.statusMessage);
+  }
 };
 
-exports.handler = function(event, context) {
+exports.handler = async function(event, context) {
   if (hookUrl) {
-    processEvent(event, context);
+    return processEvent(event, context);
   } else if (config.unencryptedHookUrl) {
     hookUrl = config.unencryptedHookUrl;
-    processEvent(event, context);
+    return processEvent(event, context);
   } else if (config.kmsEncryptedHookUrl && config.kmsEncryptedHookUrl !== '<kmsEncryptedHookUrl>') {
-    var encryptedBuf = new Buffer(config.kmsEncryptedHookUrl, 'base64');
-    var cipherText = { CiphertextBlob: encryptedBuf };
-    var kms = new AWS.KMS();
+    var encryptedBuf = Buffer.from(config.kmsEncryptedHookUrl, 'base64');
+    var kms = new KMSClient();
 
-    kms.decrypt(cipherText, function(err, data) {
-      if (err) {
-        console.log("decrypt error: " + err);
-        processEvent(event, context);
-      } else {
-        hookUrl = "https://" + data.Plaintext.toString('ascii');
-        processEvent(event, context);
-      }
-    });
+    try {
+      var data = await kms.send(new DecryptCommand({ CiphertextBlob: encryptedBuf }));
+      hookUrl = "https://" + Buffer.from(data.Plaintext).toString('ascii');
+    } catch (err) {
+      console.log("decrypt error: " + err);
+    }
+    return processEvent(event, context);
   } else {
-    context.fail('hook url has not been set.');
+    throw new Error('hook url has not been set.');
   }
 };
